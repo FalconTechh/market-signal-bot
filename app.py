@@ -6,12 +6,17 @@ Features:
 - FastAPI website/API
 - Telegram bot polling
 - Twelve Data market candles
-- RSI, EMA 9/21, MACD, Bollinger Bands, ADX, ATR
+- RSI, EMA 9/21, MACD, Bollinger Bands, ADX, ATR, Stochastic, VWAP, Fibonacci
+  retracement levels
+- Multi-timeframe confirmation (1m + 5m + 15m agreement check)
 - UP / DOWN / WAIT scoring
 - Signal history in SQLite
-- Background scheduler that watches a symbol list and pushes Telegram alerts
+- Background scheduler that watches a symbol list (multiple currencies) and
+  pushes Telegram alerts with a chart image
 - Outcome resolution job that grades past signals against real price action,
   so /api/accuracy reflects genuine historical hit-rate (not a guess)
+- Per-symbol/timeframe backtest report
+- Optional economic-calendar/news alerts (Finnhub, free tier)
 - No automatic trading/order placement
 
 Install:
@@ -21,8 +26,9 @@ Create .env (copy from .env.example):
     TWELVE_DATA_API_KEY=YOUR_TWELVE_DATA_KEY
     TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
     TELEGRAM_CHAT_ID=YOUR_CHAT_ID_FOR_ALERTS   (optional, for scheduler push)
-    WATCHLIST=AUD/NZD,EUR/USD                  (optional, for scheduler)
+    WATCHLIST=AUD/NZD,EUR/USD                  (optional, comma-separated, for scheduler)
     SCAN_INTERVAL_SECONDS=300                  (optional, default 300)
+    FINNHUB_API_KEY=                           (optional, for /news)
     HOST=0.0.0.0
     PORT=8000
 
@@ -34,8 +40,11 @@ Website:
 
 API:
     /api/signal?symbol=EUR/USD&interval=1min
+    /api/mtf?symbol=EUR/USD
     /api/history
     /api/accuracy
+    /api/backtest_report
+    /api/news
     /api/assets
     /health
 
@@ -43,8 +52,11 @@ Telegram:
     /start
     /signal EURUSD 1m
     /signal GBPUSD 5m
+    /mtf AUDNZD
     /history
     /accuracy
+    /backtest
+    /news
     /help
 
 IMPORTANT / READ THIS:
@@ -52,10 +64,10 @@ This is a market-analysis tool, not a guaranteed predictor. Nothing in this
 codebase, no matter how it's configured, can reliably predict the direction
 of the next candle with high accuracy. "Confidence" is a score derived from
 indicator agreement, not a statistical probability of being right. The
-accuracy numbers shown by /api/accuracy are historical and calculated from
-this bot's own past signals -- they are not, and cannot be, a promise about
-future performance. This tool does not place trades in Quotex or any other
-broker; it only informs.
+accuracy numbers shown by /api/accuracy and /api/backtest_report are
+historical and calculated from this bot's own past signals -- they are not,
+and cannot be, a promise about future performance. This tool does not place
+trades in Quotex or any other broker; it only informs.
 """
 
 import os
@@ -146,13 +158,17 @@ def init_db():
                 adx REAL,
                 atr REAL,
                 bb_mid REAL,
+                stoch_k REAL,
+                stoch_d REAL,
+                vwap REAL,
                 result TEXT DEFAULT 'PENDING'
             )
         """)
-        # Backfill atr column for DBs created before this field existed.
+        # Backfill columns for DBs created before these fields existed.
         cols = [r[1] for r in con.execute("PRAGMA table_info(signals)").fetchall()]
-        if "atr" not in cols:
-            con.execute("ALTER TABLE signals ADD COLUMN atr REAL")
+        for col in ["atr", "stoch_k", "stoch_d", "vwap"]:
+            if col not in cols:
+                con.execute(f"ALTER TABLE signals ADD COLUMN {col} REAL")
         con.commit()
         con.close()
 
@@ -253,6 +269,50 @@ def adx(df, n=14):
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     return dx.ewm(alpha=1/n, adjust=False).mean().fillna(0)
 
+def stochastic(df, k_period=14, d_period=3):
+    low_min = df["low"].rolling(k_period).min()
+    high_max = df["high"].rolling(k_period).max()
+    k = 100 * (df["close"] - low_min) / (high_max - low_min).replace(0, np.nan)
+    d = k.rolling(d_period).mean()
+    return k.fillna(50), d.fillna(50)
+
+def fibonacci_levels(df, lookback=50):
+    """
+    Classic retracement levels from the most recent swing high/low over the
+    lookback window. These are reference price zones traders watch for
+    reactions, not a prediction of what will happen at them.
+    """
+    window = df.tail(lookback)
+    swing_high = float(window["high"].max())
+    swing_low = float(window["low"].min())
+    diff = swing_high - swing_low
+    if diff <= 0:
+        return None
+    ratios = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
+    return {
+        str(r): round(swing_high - diff * r, 8)
+        for r in ratios
+    } | {"swing_high": round(swing_high, 8), "swing_low": round(swing_low, 8)}
+
+def vwap(df):
+    """
+    Volume-weighted average price. Forex pairs from Twelve Data usually carry
+    no real trade volume (spot FX is OTC), so this falls back to a plain
+    typical-price average when volume is missing/zero and is flagged as such.
+    For BTC/ETH, real volume is generally available and VWAP is meaningful.
+    """
+    typical = (df["high"] + df["low"] + df["close"]) / 3
+    if "volume" in df.columns:
+        vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+    else:
+        vol = pd.Series(0, index=df.index)
+    has_volume = vol.sum() > 0
+    if has_volume:
+        cum_vol = vol.cumsum().replace(0, np.nan)
+        return (typical * vol).cumsum() / cum_vol, True
+    else:
+        return typical.expanding().mean(), False
+
 def make_signal(df: pd.DataFrame):
     close = df["close"]
 
@@ -263,6 +323,9 @@ def make_signal(df: pd.DataFrame):
     bm, bu, bl = bollinger(close)
     ax = adx(df, 14)
     av = atr(df, 14)
+    stoch_k, stoch_d = stochastic(df)
+    vw, vw_has_volume = vwap(df)
+    fib = fibonacci_levels(df)
 
     i = len(df) - 1
     price = float(close.iloc[i])
@@ -274,6 +337,9 @@ def make_signal(df: pd.DataFrame):
     adx_v = float(ax.iloc[i])
     atr_v = float(av.iloc[i]) if pd.notna(av.iloc[i]) else 0.0
     bbm = float(bm.iloc[i]) if pd.notna(bm.iloc[i]) else price
+    stoch_k_v = float(stoch_k.iloc[i])
+    stoch_d_v = float(stoch_d.iloc[i])
+    vwap_v = float(vw.iloc[i]) if pd.notna(vw.iloc[i]) else price
 
     score = 0
     reasons = []
@@ -335,6 +401,32 @@ def make_signal(df: pd.DataFrame):
             score -= 10
             reasons.append("Short-term momentum down")
 
+    # Stochastic oscillator: momentum confirmation similar to RSI but faster.
+    if stoch_k_v > stoch_d_v and stoch_k_v < 80:
+        score += 10
+        reasons.append("Stochastic bullish crossover")
+    elif stoch_k_v < stoch_d_v and stoch_k_v > 20:
+        score -= 10
+        reasons.append("Stochastic bearish crossover")
+    elif stoch_k_v >= 80:
+        score -= 5
+        reasons.append("Stochastic overbought")
+    elif stoch_k_v <= 20:
+        score += 5
+        reasons.append("Stochastic oversold")
+
+    # VWAP: price above/below the volume-weighted average acts as a simple
+    # institutional-style bias filter. Weighted only when real volume exists.
+    if vw_has_volume:
+        if price > vwap_v:
+            score += 8
+            reasons.append("Above VWAP")
+        elif price < vwap_v:
+            score -= 8
+            reasons.append("Below VWAP")
+    else:
+        reasons.append("VWAP unavailable (no real volume for this instrument)")
+
     # ATR-based volatility check. This does not predict direction; it flags
     # when price is barely moving, which makes any signal (from any tool)
     # less meaningful because the "trend" may just be noise.
@@ -371,6 +463,11 @@ def make_signal(df: pd.DataFrame):
         "adx": round(adx_v, 2),
         "atr": round(atr_v, 8),
         "bb_mid": round(bbm, 8),
+        "stoch_k": round(stoch_k_v, 2),
+        "stoch_d": round(stoch_d_v, 2),
+        "vwap": round(vwap_v, 8),
+        "vwap_has_volume": vw_has_volume,
+        "fibonacci": fib,
         "reasons": reasons,
     }
 
@@ -380,12 +477,13 @@ def save_signal(symbol, interval, s):
         cur = con.execute("""
             INSERT INTO signals
             (symbol, interval, timestamp, price, direction, score, confidence,
-             rsi, ema9, ema21, macd, macd_signal, adx, atr, bb_mid)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             rsi, ema9, ema21, macd, macd_signal, adx, atr, bb_mid, stoch_k, stoch_d, vwap)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             symbol, interval, s["timestamp"], s["price"], s["direction"],
             s["score"], s["confidence"], s["rsi"], s["ema9"], s["ema21"],
-            s["macd"], s["macd_signal"], s["adx"], s.get("atr"), s["bb_mid"]
+            s["macd"], s["macd_signal"], s["adx"], s.get("atr"), s["bb_mid"],
+            s.get("stoch_k"), s.get("stoch_d"), s.get("vwap")
         ))
         con.commit()
         signal_id = cur.lastrowid
@@ -399,6 +497,46 @@ def calculate_signal(symbol, interval):
     s = make_signal(df)
     s["id"] = save_signal(normalize_symbol(symbol), normalize_interval(interval), s)
     return s
+
+def multi_timeframe_signal(symbol):
+    """
+    Computes a signal independently on 1m, 5m and 15m, then checks whether
+    they agree. Agreement across timeframes is a stronger (still not
+    guaranteed) filter than any single timeframe alone, because it rules out
+    signals that are just short-term noise on one chart.
+    Does NOT save these to the history table (only /signal saves history),
+    to keep the accuracy tracker meaning "signals someone actually acted on".
+    """
+    results = {}
+    for tf in ["1min", "5min", "15min"]:
+        try:
+            df = fetch_candles(symbol, tf)
+            if len(df) < 60:
+                results[tf] = None
+                continue
+            results[tf] = make_signal(df)
+        except Exception as e:
+            results[tf] = None
+
+    directions = [r["direction"] for r in results.values() if r is not None]
+    up_count = directions.count("UP")
+    down_count = directions.count("DOWN")
+
+    if up_count >= 2 and down_count == 0:
+        consensus = "UP"
+    elif down_count >= 2 and up_count == 0:
+        consensus = "DOWN"
+    elif up_count and down_count:
+        consensus = "CONFLICT"
+    else:
+        consensus = "WAIT"
+
+    return {
+        "symbol": normalize_symbol(symbol),
+        "timeframes": results,
+        "consensus": consensus,
+        "agreement": f"{max(up_count, down_count)}/{len(directions)} timeframes agree" if directions else "no data",
+    }
 
 INTERVAL_MINUTES = {"1min": 1, "5min": 5, "15min": 15}
 
@@ -464,8 +602,74 @@ def resolve_pending_signals():
 
     return resolved_count
 
+def generate_chart_image(df, s, symbol, interval):
+    """
+    Renders a PNG (in-memory) with price, EMA9/21, Bollinger Bands, and
+    RSI/Stochastic sub-panel, for sending to Telegram as a photo.
+    Returns None if matplotlib isn't installed (optional dependency).
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import io
+    except Exception:
+        return None
+
+    close = df["close"]
+    e9 = ema(close, 9)
+    e21 = ema(close, 21)
+    bm, bu, bl = bollinger(close)
+    k, d = stochastic(df)
+
+    tail = 80
+    x = df["datetime"].tail(tail)
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(8, 6), gridspec_kw={"height_ratios": [3, 1]}, sharex=True
+    )
+    fig.patch.set_facecolor("#0b1020")
+    for ax in (ax1, ax2):
+        ax.set_facecolor("#0b1020")
+        ax.tick_params(colors="#aaaaaa", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#333333")
+
+    ax1.plot(x, close.tail(tail), color="#3a63ff", linewidth=1.4, label="Close")
+    ax1.plot(x, e9.tail(tail), color="#22c55e", linewidth=1, label="EMA9")
+    ax1.plot(x, e21.tail(tail), color="#f97316", linewidth=1, label="EMA21")
+    ax1.plot(x, bu.tail(tail), color="#666666", linewidth=0.8, linestyle="--")
+    ax1.plot(x, bl.tail(tail), color="#666666", linewidth=0.8, linestyle="--")
+    ax1.set_title(
+        f"{normalize_symbol(symbol)} ({normalize_interval(interval)}) — {s['direction']}",
+        color="#ffffff", fontsize=11
+    )
+    ax1.legend(facecolor="#151c32", labelcolor="#ffffff", fontsize=7, loc="upper left")
+
+    ax2.plot(x, k.tail(tail), color="#a78bfa", linewidth=1, label="%K")
+    ax2.plot(x, d.tail(tail), color="#f472b6", linewidth=1, label="%D")
+    ax2.axhline(80, color="#555555", linewidth=0.6, linestyle="--")
+    ax2.axhline(20, color="#555555", linewidth=0.6, linestyle="--")
+    ax2.set_ylim(0, 100)
+    ax2.legend(facecolor="#151c32", labelcolor="#ffffff", fontsize=7, loc="upper left")
+
+    fig.autofmt_xdate(rotation=30)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", facecolor=fig.get_facecolor(), dpi=130)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
 def format_signal(symbol, interval, s):
     arrow = "📈" if s["direction"] == "UP" else "📉" if s["direction"] == "DOWN" else "⚪"
+    fib_line = ""
+    if s.get("fibonacci"):
+        f = s["fibonacci"]
+        fib_line = (
+            f"\nFib 0.382/0.5/0.618: {f['0.382']} / {f['0.5']} / {f['0.618']}\n"
+        )
     return (
         f"{arrow} MARKET SIGNAL\n\n"
         f"Asset: {normalize_symbol(symbol)}\n"
@@ -478,12 +682,32 @@ def format_signal(symbol, interval, s):
         f"EMA 9: {s['ema9']}\n"
         f"EMA 21: {s['ema21']}\n"
         f"MACD: {s['macd']}\n"
-        f"MACD signal: {s['macd_signal']}\n"
-        f"ADX: {s['adx']}\n\n"
-        f"Reasons: {', '.join(s['reasons'][:5])}\n\n"
+        f"ADX: {s['adx']}\n"
+        f"ATR: {s['atr']}\n"
+        f"Stochastic %K/%D: {s.get('stoch_k')}/{s.get('stoch_d')}\n"
+        f"VWAP: {s.get('vwap')}"
+        f"{' (no real volume, approximate)' if not s.get('vwap_has_volume') else ''}\n"
+        f"{fib_line}\n"
+        f"Reasons: {', '.join(s['reasons'][:6])}\n\n"
         "⚠️ Analysis only. No guarantee of future price movement. "
         "This bot does not place trades."
     )
+
+def format_mtf(mtf):
+    lines = [f"🧭 MULTI-TIMEFRAME CHECK: {mtf['symbol']}\n"]
+    for tf_key, label in [("1min", "1m"), ("5min", "5m"), ("15min", "15m")]:
+        r = mtf["timeframes"].get(tf_key)
+        if r is None:
+            lines.append(f"{label}: no data")
+        else:
+            arrow = "📈" if r["direction"] == "UP" else "📉" if r["direction"] == "DOWN" else "⚪"
+            lines.append(f"{label}: {arrow} {r['direction']} (score {r['score']:+d})")
+    lines.append(f"\nConsensus: {mtf['consensus']} ({mtf['agreement']})")
+    lines.append(
+        "\n⚠️ Agreement across timeframes is a stronger filter than one "
+        "timeframe alone, but it is still not a guarantee."
+    )
+    return "\n".join(lines)
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -612,7 +836,9 @@ async function getSignal(){
    'EMA 21: '+d.ema21+'\\n'+
    'MACD: '+d.macd+'\\n'+
    'ADX: '+d.adx+'\\n'+
-   'ATR: '+d.atr+'\\n\\n'+
+   'ATR: '+d.atr+'\\n'+
+   'Stochastic %K/%D: '+d.stoch_k+'/'+d.stoch_d+'\\n'+
+   'VWAP: '+d.vwap+'\\n\\n'+
    'Reasons: '+d.reasons.join(', ');
 
   const hr = await fetch('/api/history?limit=30');
@@ -682,6 +908,94 @@ def api_accuracy():
 def api_assets():
     return {"assets": list(SYMBOLS.values())}
 
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+
+def fetch_economic_events(currencies=None, hours_ahead=48):
+    """
+    Pulls upcoming economic-calendar events (rate decisions, CPI, NFP, etc.)
+    from Finnhub's free economic calendar endpoint. Requires a free
+    FINNHUB_API_KEY (finnhub.io) — returns a clear message if not configured,
+    rather than failing silently.
+    """
+    if not FINNHUB_API_KEY:
+        return {"configured": False, "events": [],
+                "message": "Set FINNHUB_API_KEY (free at finnhub.io) to enable news/economic alerts."}
+
+    from datetime import timedelta
+    today = datetime.now(timezone.utc).date()
+    end = (datetime.now(timezone.utc) + timedelta(hours=hours_ahead)).date()
+
+    r = requests.get(
+        "https://finnhub.io/api/v1/calendar/economic",
+        params={"from": str(today), "to": str(end), "token": FINNHUB_API_KEY},
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json().get("economicCalendar", [])
+
+    if currencies:
+        data = [e for e in data if e.get("country") in currencies]
+
+    # Keep only medium/high impact to avoid noise
+    data = [e for e in data if e.get("impact") in ("medium", "high")]
+    data.sort(key=lambda e: e.get("time", ""))
+    return {"configured": True, "events": data[:15]}
+
+@app.get("/api/news")
+def api_news():
+    return fetch_economic_events()
+
+@app.get("/api/mtf")
+def api_mtf(symbol: str = Query("AUD/NZD")):
+    try:
+        return multi_timeframe_signal(symbol)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/backtest_report")
+def api_backtest_report():
+    """
+    Historical hit-rate broken down per symbol and per timeframe, computed
+    only from this bot's own resolved past signals. This is a report on what
+    already happened, not a forecast.
+    """
+    with DB_LOCK:
+        con = db()
+        rows = con.execute("""
+            SELECT symbol, interval,
+                   COUNT(*) as resolved,
+                   SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) as losses,
+                   SUM(CASE WHEN result='FLAT' THEN 1 ELSE 0 END) as flats
+            FROM signals
+            WHERE result IN ('WIN','LOSS','FLAT')
+            GROUP BY symbol, interval
+            ORDER BY symbol, interval
+        """).fetchall()
+        con.close()
+
+    report = []
+    for r in rows:
+        resolved = r["resolved"]
+        wins = r["wins"]
+        accuracy = round((wins / resolved) * 100, 2) if resolved else None
+        report.append({
+            "symbol": r["symbol"],
+            "interval": r["interval"],
+            "resolved": resolved,
+            "wins": wins,
+            "losses": r["losses"],
+            "flats": r["flats"],
+            "accuracy_percent": accuracy,
+        })
+
+    return {
+        "report": report,
+        "note": "Historical only, grouped by symbol/timeframe. Small sample "
+                "sizes are not statistically reliable — treat early numbers "
+                "with caution.",
+    }
+
 # ---------------- Scheduler ----------------
 
 WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "").split(",") if s.strip()]
@@ -712,7 +1026,9 @@ async def scheduler_loop():
 
         for raw_symbol in WATCHLIST:
             try:
-                s = await asyncio.to_thread(calculate_signal, raw_symbol, "5m")
+                df = await asyncio.to_thread(fetch_candles, raw_symbol, "5m")
+                s = make_signal(df)
+                s["id"] = await asyncio.to_thread(save_signal, normalize_symbol(raw_symbol), "5min", s)
                 print(f"Scheduler: {normalize_symbol(raw_symbol)} -> {s['direction']} ({s['confidence']})")
 
                 tg_app = _telegram_app_ref["app"]
@@ -721,6 +1037,9 @@ async def scheduler_loop():
                         chat_id=TELEGRAM_CHAT_ID,
                         text=format_signal(raw_symbol, "5m", s),
                     )
+                    chart = await asyncio.to_thread(generate_chart_image, df, s, raw_symbol, "5m")
+                    if chart:
+                        await tg_app.bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=chart)
             except Exception as e:
                 print(f"Scheduler error for {raw_symbol}: {e}")
 
@@ -745,10 +1064,12 @@ async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ Market Signal Bot\n\n"
         "Commands:\n"
-        "/signal EURUSD 1m\n"
-        "/signal GBPUSD 5m\n"
-        "/history\n"
-        "/accuracy\n"
+        "/signal EURUSD 1m — signal + chart\n"
+        "/mtf AUDNZD — 1m+5m+15m agreement check\n"
+        "/history — last 10 signals\n"
+        "/accuracy — overall hit-rate\n"
+        "/backtest — hit-rate per symbol/timeframe\n"
+        "/news — upcoming economic events\n"
         "/help\n\n"
         "Analysis only — no automatic trading."
     )
@@ -764,10 +1085,63 @@ async def tg_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text("⏳ Analyzing latest market candles...")
-        s = await asyncio.to_thread(calculate_signal, symbol, interval)
+        df = await asyncio.to_thread(fetch_candles, symbol, interval)
+        s = make_signal(df)
+        s["id"] = await asyncio.to_thread(save_signal, normalize_symbol(symbol), normalize_interval(interval), s)
         await update.message.reply_text(format_signal(symbol, interval, s))
+
+        chart = await asyncio.to_thread(generate_chart_image, df, s, symbol, interval)
+        if chart:
+            await update.message.reply_photo(photo=chart)
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
+
+async def tg_mtf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not context.args:
+            await update.message.reply_text("Example: /mtf AUDNZD")
+            return
+        symbol = context.args[0]
+        await update.message.reply_text("⏳ Checking 1m / 5m / 15m together...")
+        mtf = await asyncio.to_thread(multi_timeframe_signal, symbol)
+        await update.message.reply_text(format_mtf(mtf))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def tg_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = api_backtest_report()
+    report = data["report"]
+    if not report:
+        await update.message.reply_text("No resolved signals yet to report on.")
+        return
+    lines = ["📊 BACKTEST REPORT (this bot's own history)\n"]
+    for row in report:
+        acc = row["accuracy_percent"]
+        acc_str = f"{acc}%" if acc is not None else "N/A"
+        lines.append(
+            f"{row['symbol']} {row['interval']}: {row['wins']}W/{row['losses']}L/{row['flats']}F "
+            f"— {acc_str}"
+        )
+    lines.append(f"\n{data['note']}")
+    await update.message.reply_text("\n".join(lines))
+
+async def tg_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = fetch_economic_events()
+    if not data["configured"]:
+        await update.message.reply_text(f"ℹ️ {data['message']}")
+        return
+    events = data["events"]
+    if not events:
+        await update.message.reply_text("No medium/high-impact events found in the next 48 hours.")
+        return
+    lines = ["📰 UPCOMING ECONOMIC EVENTS (next 48h)\n"]
+    for e in events[:10]:
+        lines.append(
+            f"{e.get('time','?')} | {e.get('country','?')} | {e.get('event','?')} "
+            f"({e.get('impact','?')})"
+        )
+    lines.append("\n⚠️ High-impact events can cause sudden volatility that overrides any technical signal.")
+    await update.message.reply_text("\n".join(lines))
 
 async def tg_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with DB_LOCK:
@@ -812,6 +1186,9 @@ async def run_telegram():
     tg_app.add_handler(CommandHandler("signal", tg_signal))
     tg_app.add_handler(CommandHandler("history", tg_history))
     tg_app.add_handler(CommandHandler("accuracy", tg_accuracy))
+    tg_app.add_handler(CommandHandler("mtf", tg_mtf))
+    tg_app.add_handler(CommandHandler("backtest", tg_backtest))
+    tg_app.add_handler(CommandHandler("news", tg_news))
 
     _telegram_app_ref["app"] = tg_app
 
