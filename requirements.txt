@@ -1,10 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
+python-telegram-bot>=20,<23
+python-dotenv
 requests
-pandas
 numpy
-python-dotenv
-python-telegram-bot
-matplotlib
-python-dotenv
+pandas
 scikit-learn
