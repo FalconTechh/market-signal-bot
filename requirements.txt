@@ -6,3 +6,5 @@ numpy
 python-dotenv
 python-telegram-bot
 matplotlib
+python-dotenv
+scikit-learn
