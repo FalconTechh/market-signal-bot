@@ -1,0 +1,743 @@
+import os
+import time
+import sqlite3
+import threading
+import asyncio
+import logging
+import math
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+from flask import Flask
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+
+# ============================================================
+# NexCandle AI v2 - production-oriented Telegram signal bot
+# ============================================================
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
+ADMIN_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
+DB = os.getenv("DATABASE_PATH", "nexcandle.db")
+PREMIUM_DAYS = int(os.getenv("PREMIUM_DAYS", "30"))
+ALERT_SEC = max(30, int(os.getenv("ALERT_INTERVAL_SECONDS", "60")))
+INDIA_UPI = os.getenv("INDIA_UPI", "").strip()
+UAE_BOTIM = os.getenv("UAE_BOTIM", "").strip()
+PREMIUM_PRICE = os.getenv("PREMIUM_PRICE", "").strip()
+MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "72"))
+CACHE_SECONDS = int(os.getenv("MARKET_CACHE_SECONDS", "20"))
+
+PAIRS = {
+    "EUR/USD": {"finnhub": "OANDA:EUR_USD", "yahoo": "EURUSD=X", "td": "EUR/USD"},
+    "GBP/USD": {"finnhub": "OANDA:GBP_USD", "yahoo": "GBPUSD=X", "td": "GBP/USD"},
+    "USD/JPY": {"finnhub": "OANDA:USD_JPY", "yahoo": "JPY=X", "td": "USD/JPY"},
+    "USD/CHF": {"finnhub": "OANDA:USD_CHF", "yahoo": "CHF=X", "td": "USD/CHF"},
+    "AUD/USD": {"finnhub": "OANDA:AUD_USD", "yahoo": "AUDUSD=X", "td": "AUD/USD"},
+    "USD/CAD": {"finnhub": "OANDA:USD_CAD", "yahoo": "CAD=X", "td": "USD/CAD"},
+    "NZD/USD": {"finnhub": "OANDA:NZD_USD", "yahoo": "NZDUSD=X", "td": "NZD/USD"},
+    "EUR/GBP": {"finnhub": "OANDA:EUR_GBP", "yahoo": "EURGBP=X", "td": "EUR/GBP"},
+    "EUR/JPY": {"finnhub": "OANDA:EUR_JPY", "yahoo": "EURJPY=X", "td": "EUR/JPY"},
+    "GBP/JPY": {"finnhub": "OANDA:GBP_JPY", "yahoo": "GBPJPY=X", "td": "GBP/JPY"},
+}
+TF_MIN = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "45m": 45, "1h": 60, "4h": 240}
+TF_SECONDS = {k: v * 60 for k, v in TF_MIN.items()}
+
+S = requests.Session()
+S.headers.update({"User-Agent": "NexCandleAI/2.0 market-data-client"})
+LOCK = threading.RLock()
+MARKET_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame, str]] = {}
+USER_STATE: Dict[int, Dict[str, Any]] = {}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("nexcandle")
+
+web = Flask(__name__)
+
+@web.get("/")
+def home():
+    return {"service": "NexCandle AI", "version": "2.0", "status": "online"}
+
+@web.get("/health")
+def health():
+    provider = []
+    if FINNHUB_API_KEY:
+        provider.append("finnhub")
+    if TWELVEDATA_API_KEY:
+        provider.append("twelvedata")
+    provider.append("yahoo_fallback")
+    return {"status": "ok", "providers": provider, "cache_items": len(MARKET_CACHE)}
+
+def run_web():
+    web.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), debug=False, use_reloader=False)
+
+# ---------------- DB ----------------
+
+def con():
+    c = sqlite3.connect(DB, timeout=30, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def init():
+    with LOCK:
+        c = con()
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            premium_until TEXT,
+            free_signals INTEGER DEFAULT 3,
+            alerts INTEGER DEFAULT 0,
+            alert_score INTEGER DEFAULT 80,
+            alert_tf TEXT DEFAULT '5m',
+            alert_direction TEXT DEFAULT 'BOTH',
+            created TEXT,
+            updated TEXT
+        );
+        CREATE TABLE IF NOT EXISTS payments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            amount TEXT,
+            method TEXT,
+            reference TEXT,
+            proof_file_id TEXT,
+            status TEXT DEFAULT 'pending',
+            admin_note TEXT,
+            created TEXT,
+            reviewed TEXT
+        );
+        CREATE TABLE IF NOT EXISTS signals(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            pair TEXT,
+            tf TEXT,
+            direction TEXT,
+            score INTEGER,
+            entry REAL,
+            stop REAL,
+            target REAL,
+            rr REAL,
+            candle TEXT,
+            created TEXT,
+            resolved TEXT DEFAULT 'PENDING',
+            resolved_at TEXT,
+            result_reason TEXT
+        );
+        CREATE TABLE IF NOT EXISTS alert_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            pair TEXT,
+            tf TEXT,
+            direction TEXT,
+            candle TEXT,
+            UNIQUE(user_id,pair,tf,direction,candle)
+        );
+        CREATE TABLE IF NOT EXISTS system_logs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            level TEXT,
+            component TEXT,
+            message TEXT,
+            created TEXT
+        );
+        """)
+        # Lightweight migrations for databases created by v1.
+        migrations = {
+            "users": {"alert_score":"INTEGER DEFAULT 80", "alert_tf":"TEXT DEFAULT '5m'", "alert_direction":"TEXT DEFAULT 'BOTH'", "updated":"TEXT"},
+            "payments": {"amount":"TEXT", "method":"TEXT", "proof_file_id":"TEXT", "admin_note":"TEXT", "reviewed":"TEXT"},
+            "signals": {"resolved_at":"TEXT", "result_reason":"TEXT"}
+        }
+        for table, cols in migrations.items():
+            existing = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+            for col, spec in cols.items():
+                if col not in existing:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {spec}")
+        c.commit(); c.close()
+
+def db_log(level, component, message):
+    log.log(getattr(logging, level.upper(), logging.INFO), "%s: %s", component, message)
+    try:
+        with LOCK:
+            c = con(); c.execute("INSERT INTO system_logs(level,component,message,created) VALUES(?,?,?,?)", (level, component, str(message)[:1000], now_iso())); c.commit(); c.close()
+    except Exception:
+        pass
+
+def ensure_user(tg_user):
+    with LOCK:
+        c = con()
+        c.execute("""INSERT INTO users(user_id,username,first_name,free_signals,created,updated)
+        VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,first_name=excluded.first_name,updated=excluded.updated""",
+                  (tg_user.id, tg_user.username or "", tg_user.first_name or "", 3, now_iso(), now_iso()))
+        c.commit(); c.close()
+
+def is_admin(uid):
+    return bool(ADMIN_ID) and str(uid) == str(ADMIN_ID)
+
+def premium_until(uid):
+    if is_admin(uid):
+        return datetime.now(timezone.utc) + timedelta(days=3650)
+    with LOCK:
+        c = con(); r = c.execute("SELECT premium_until FROM users WHERE user_id=?", (uid,)).fetchone(); c.close()
+    if not r or not r["premium_until"]:
+        return None
+    try:
+        dt = datetime.fromisoformat(r["premium_until"])
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def premium(uid):
+    dt = premium_until(uid)
+    return bool(dt and dt > datetime.now(timezone.utc))
+
+def user_row(uid):
+    with LOCK:
+        c = con(); r = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone(); c.close()
+    return r
+
+def free_ok(uid):
+    if premium(uid): return True
+    r = user_row(uid)
+    return bool(r and r["free_signals"] > 0)
+
+def consume(uid):
+    if premium(uid): return
+    with LOCK:
+        c = con(); c.execute("UPDATE users SET free_signals=MAX(free_signals-1,0),updated=? WHERE user_id=?", (now_iso(), uid)); c.commit(); c.close()
+
+# ---------------- Market data ----------------
+
+def _clean_df(df):
+    if df is None or df.empty: return pd.DataFrame()
+    df = df.copy()
+    cols = {c.lower(): c for c in df.columns}
+    needed = {}
+    for name in ("open", "high", "low", "close"):
+        if name in cols: needed[name] = cols[name]
+    if len(needed) < 4: return pd.DataFrame()
+    out = df[[needed["open"], needed["high"], needed["low"], needed["close"]]].copy()
+    out.columns = ["open", "high", "low", "close"]
+    out = out.apply(pd.to_numeric, errors="coerce").dropna()
+    out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
+    out = out[~out.index.isna()].sort_index()
+    return out[~out.index.duplicated(keep="last")]
+
+def _finnhub(pair, tf, limit):
+    if not FINNHUB_API_KEY: raise RuntimeError("Finnhub key not configured")
+    # Finnhub supports 1/5/15/30/60/ D/W/M. 45m is built from validated 15m candles.
+    base_tf = 15 if tf == "45m" else TF_MIN[tf]
+    if base_tf not in (1,5,15,30,60,240):
+        raise RuntimeError("Unsupported Finnhub resolution")
+    now = int(time.time())
+    span = max(400, limit * 5)
+    start = now - base_tf * 60 * span
+    r = S.get("https://finnhub.io/api/v1/forex/candle", params={"symbol": PAIRS[pair]["finnhub"], "resolution": base_tf, "from": start, "to": now, "token": FINNHUB_API_KEY}, timeout=12)
+    if r.status_code != 200:
+        raise RuntimeError(f"Finnhub HTTP {r.status_code}")
+    d = r.json()
+    if d.get("s") != "ok" or not d.get("t"):
+        raise RuntimeError(f"Finnhub status: {d.get('s','unknown')}")
+    x = pd.DataFrame({"open": d["o"], "high": d["h"], "low": d["l"], "close": d["c"]}, index=pd.to_datetime(d["t"], unit="s", utc=True))
+    x = _clean_df(x)
+    if tf == "45m":
+        x = x.resample("45min", origin="epoch", label="left", closed="left").agg({"open":"first","high":"max","low":"min","close":"last"}).dropna()
+    return x.tail(limit)
+
+def _twelvedata(pair, tf, limit):
+    if not TWELVEDATA_API_KEY: raise RuntimeError("TwelveData key not configured")
+    intervals = {"1m":"1min","5m":"5min","15m":"15min","30m":"30min","45m":"45min","1h":"1h","4h":"4h"}
+    r = S.get("https://api.twelvedata.com/time_series", params={"symbol": PAIRS[pair]["td"], "interval": intervals[tf], "outputsize": min(max(limit, 200), 5000), "timezone":"UTC", "apikey":TWELVEDATA_API_KEY}, timeout=15)
+    if r.status_code != 200: raise RuntimeError(f"TwelveData HTTP {r.status_code}")
+    d = r.json()
+    if "values" not in d: raise RuntimeError(d.get("message", "TwelveData returned no data"))
+    x = pd.DataFrame(d["values"])
+    x["datetime"] = pd.to_datetime(x["datetime"], utc=True)
+    x = x.set_index("datetime").sort_index()
+    return _clean_df(x).tail(limit)
+
+def _yahoo(pair, tf, limit):
+    # Public Yahoo chart endpoint is used only as a fallback. It may be delayed and is not a broker feed.
+    intervals = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","45m":"15m","1h":"60m","4h":"60m"}
+    interval = intervals[tf]
+    # Yahoo limits 1m to a short period; request a bounded window.
+    seconds = {"1m": 2*86400, "5m": 10*86400, "15m": 30*86400, "30m": 45*86400, "45m": 60*86400, "1h": 180*86400, "4h": 365*86400}[tf]
+    now = int(time.time()); start = now - seconds
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{PAIRS[pair]['yahoo']}"
+    r = S.get(url, params={"period1":start,"period2":now,"interval":interval,"events":"history","includeAdjustedClose":"true"}, timeout=15)
+    if r.status_code != 200: raise RuntimeError(f"Yahoo HTTP {r.status_code}")
+    js = r.json(); res = js.get("chart",{}).get("result")
+    if not res: raise RuntimeError("Yahoo returned no chart data")
+    res = res[0]
+    q = res.get("indicators",{}).get("quote",[{}])[0]
+    x = pd.DataFrame({"open":q.get("open",[]),"high":q.get("high",[]),"low":q.get("low",[]),"close":q.get("close",[])}, index=pd.to_datetime(res.get("timestamp",[]),unit="s",utc=True))
+    x = _clean_df(x)
+    if tf == "45m":
+        x = x.resample("45min", origin="epoch", label="left", closed="left").agg({"open":"first","high":"max","low":"min","close":"last"}).dropna()
+    elif tf == "4h":
+        x = x.resample("4h", origin="epoch", label="left", closed="left").agg({"open":"first","high":"max","low":"min","close":"last"}).dropna()
+    return x.tail(limit)
+
+def candles(pair, tf, limit=350):
+    if pair not in PAIRS or tf not in TF_MIN: raise ValueError("Unsupported pair/timeframe")
+    key = (pair, tf)
+    with LOCK:
+        cached = MARKET_CACHE.get(key)
+        if cached and time.time() - cached[0] <= CACHE_SECONDS and len(cached[1]) >= min(limit, 100):
+            return cached[1].tail(limit).copy()
+    errors=[]
+    providers=[]
+    if FINNHUB_API_KEY: providers.append(("finnhub", _finnhub))
+    if TWELVEDATA_API_KEY: providers.append(("twelvedata", _twelvedata))
+    providers.append(("yahoo", _yahoo))
+    for name, fn in providers:
+        try:
+            x=fn(pair,tf,limit)
+            if len(x) < 80: raise RuntimeError(f"insufficient candles ({len(x)})")
+            # Remove a potentially incomplete last candle for stable technical analysis.
+            interval = TF_SECONDS[tf]
+            last_epoch = int(x.index[-1].timestamp())
+            if int(time.time()) - last_epoch < interval and len(x)>80:
+                x=x.iloc[:-1]
+            with LOCK: MARKET_CACHE[key]=(time.time(),x.copy(),name)
+            return x.tail(limit).copy()
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+            db_log("warning","market",errors[-1])
+    raise RuntimeError("Live market data is temporarily unavailable. Please retry shortly.")
+
+def provider_status():
+    return [name for name,key in (("Finnhub",FINNHUB_API_KEY),("TwelveData",TWELVEDATA_API_KEY)) if key] + ["Yahoo fallback"]
+
+# ---------------- Indicators / strategy ----------------
+
+def ema(s,n): return s.ewm(span=n, adjust=False).mean()
+def rsi(s,n=14):
+    d=s.diff(); g=d.clip(lower=0); l=-d.clip(upper=0)
+    ag=g.ewm(alpha=1/n,adjust=False).mean(); al=l.ewm(alpha=1/n,adjust=False).mean()
+    rs=ag/al.replace(0,np.nan)
+    return 100-100/(1+rs)
+def atr(x,n=14):
+    p=x.close.shift(); tr=pd.concat([x.high-x.low,(x.high-p).abs(),(x.low-p).abs()],axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n,adjust=False).mean()
+def calc(x):
+    x=x.copy()
+    x["e9"]=ema(x.close,9); x["e21"]=ema(x.close,21); x["e50"]=ema(x.close,50); x["e200"]=ema(x.close,200)
+    x["rsi"]=rsi(x.close); x["atr"]=atr(x)
+    m=ema(x.close,12)-ema(x.close,26); x["macd"]=m; x["ms"]=ema(m,9)
+    x["bb"]=x.close.rolling(20).mean(); sd=x.close.rolling(20).std(); x["bu"]=x.bb+2*sd; x["bl"]=x.bb-2*sd
+    x["vol_ratio"]=((x.high-x.low)/x.close).replace([np.inf,-np.inf],np.nan)
+    return x.dropna()
+
+def analyse(x):
+    x=calc(x)
+    if len(x)<10: raise RuntimeError("Not enough validated candles")
+    a=x.iloc[-1]; p=x.iloc[-2]; bull=bear=0; why=[]
+    if a.e9>a.e21>a.e50: bull+=22; why.append("EMA structure bullish")
+    elif a.e9<a.e21<a.e50: bear+=22; why.append("EMA structure bearish")
+    else: why.append("EMA structure mixed")
+    if a.close>a.e200: bull+=12; why.append("price above EMA200")
+    else: bear+=12; why.append("price below EMA200")
+    if a.macd>a.ms and a.macd>=p.macd: bull+=15; why.append("MACD momentum positive")
+    elif a.macd<a.ms and a.macd<=p.macd: bear+=15; why.append("MACD momentum negative")
+    else: why.append("MACD momentum mixed")
+    if 52<=a.rsi<=68: bull+=13; why.append("RSI supports bullish continuation")
+    elif 32<=a.rsi<=48: bear+=13; why.append("RSI supports bearish continuation")
+    elif a.rsi>72 or a.rsi<28: why.append("RSI extreme - caution")
+    if a.close>a.bb: bull+=8
+    elif a.close<a.bb: bear+=8
+    # recent candle structure
+    body=abs(a.close-a.open); rng=max(a.high-a.low,1e-12)
+    if a.close>a.open and body/rng>=0.55: bull+=8; why.append("strong bullish candle")
+    elif a.close<a.open and body/rng>=0.55: bear+=8; why.append("strong bearish candle")
+    # volatility sanity
+    if np.isfinite(a.atr) and a.atr>0: 
+        if 0.00005 <= float(a.atr/a.close) <= 0.02: 
+            bull+=2; bear+=2
+    gap=abs(bull-bear)
+    if gap<18: direction="WAIT"
+    else: direction="CALL" if bull>bear else "PUT"
+    score=int(min(100, max(bull,bear)*1.05))
+    return direction, score, why, x
+
+def mtf(pair, entry_tf="5m"):
+    # Confirmation uses the entry TF plus progressively higher TFs. 4H is never required for 1M.
+    hierarchy={"1m":["1m","5m","15m","30m"],"5m":["5m","15m","30m","1h"],"15m":["15m","30m","1h","4h"],"30m":["30m","1h","4h"],"45m":["45m","1h","4h"],"1h":["1h","4h"],"4h":["4h"]}
+    weights=[1.0,1.3,1.6,2.0]
+    out={}; totals={"CALL":0.0,"PUT":0.0}; available=0
+    for i,tf in enumerate(hierarchy[entry_tf]):
+        try:
+            d,s,why,_=analyse(candles(pair,tf)); out[tf]=(d,s); available+=1
+            if d in totals: totals[d]+=s*weights[min(i,len(weights)-1)]
+        except Exception:
+            out[tf]=("UNAVAILABLE",0)
+    if available==0: raise RuntimeError("No validated MTF data available")
+    if totals["CALL"] > totals["PUT"]*1.14: final="CALL"
+    elif totals["PUT"] > totals["CALL"]*1.14: final="PUT"
+    else: final="WAIT"
+    score=int(min(100, max(totals.values())/(sum(weights[:available])*0.95)))
+    return final, score, out
+
+def candle_boundary(tf):
+    n=TF_SECONDS[tf]; now=int(time.time()); return n-(now%n)
+
+def fmt_duration(seconds):
+    seconds=max(0,int(seconds)); return f"{seconds//3600}h {(seconds%3600)//60}m {seconds%60}s" if seconds>=3600 else f"{seconds//60}m {seconds%60}s"
+
+def make_signal(pair, tf):
+    x=candles(pair,tf)
+    d,s,why,x=analyse(x)
+    md,ms,m=mtf(pair,tf)
+    # Entry only when local and MTF agree. This deliberately creates WAIT states instead of forced calls.
+    final=d if d==md else "WAIT"
+    score=int(min(100, s*0.60+ms*0.40))
+    if final=="WAIT" or score<MIN_SIGNAL_SCORE:
+        final="WAIT"
+    entry=stop=target=rr=None
+    if final!="WAIT":
+        e=float(x.close.iloc[-1]); v=max(float(x.atr.iloc[-1]),e*0.00008)
+        risk=1.15*v; reward=1.85*v
+        if final=="CALL": stop=e-risk; target=e+reward
+        else: stop=e+risk; target=e-reward
+        entry=e; rr=reward/risk
+    return {"pair":pair,"tf":tf,"direction":final,"score":score,"why":why,"mtf":m,"wait":candle_boundary(tf),"entry":entry,"stop":stop,"target":target,"rr":rr,"candle":x.index[-1].isoformat(),"provider":MARKET_CACHE.get((pair,tf),(0,None,"unknown"))[2]}
+
+def fmt_signal(s, detailed=True):
+    lines=["⚡ <b>NexCandle AI — SIGNAL</b>",f"💱 <b>{s['pair']}</b> • ⏱ <b>{s['tf']}</b>",""]
+    if s["direction"]=="WAIT":
+        lines += ["🟡 <b>NO TRADE / WAIT</b>",f"🎯 Setup score: <b>{s['score']}/100</b>","Reason: local and higher-timeframe confirmation is not strong enough.","⛔ Do not force an entry."]
+    else:
+        lines += [f"📌 <b>{s['direction']}</b>",f"🎯 Setup score: <b>{s['score']}/100</b>",f"📍 Entry reference: <code>{s['entry']:.6f}</code>",f"🛑 SL reference: <code>{s['stop']:.6f}</code>",f"🎯 TP reference: <code>{s['target']:.6f}</code>",f"⚖️ Risk/Reward: <b>1:{s['rr']:.2f}</b>","",f"⏱ Next candle: <b>{fmt_duration(s['wait'])}</b>",f"🟢 Entry timing: wait for candle confirmation; valid window starts after confirmation and ends before the next candle boundary."]
+    if detailed:
+        lines += ["", "🧭 <b>MTF CONFIRMATION</b>"]
+        for tf,(d,sc) in s["mtf"].items(): lines.append(f"{tf}: {d} ({sc})")
+        lines += ["", "🧠 <b>WHY</b>", "• "+"\n• ".join(s["why"][:6]), "", f"📡 Data source: {s['provider']}", "⚠️ Score is technical setup quality, not a guaranteed probability or profit forecast."]
+    return "\n".join(lines)
+
+# ---------------- UI ----------------
+
+WELCOME = """⚡ <b>NexCandle AI</b>\n\nWelcome! 👋\n\nLive market analysis, multi-timeframe confirmation, entry timing, scanner, backtesting, performance tracking and premium alerts — all from the buttons below.\n\nYou do <b>not</b> need to type /start. Any first message will open this dashboard.\n\n⚠️ No system can guarantee the next candle or future profit."""
+
+def menu(uid):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Get Signal",callback_data="signal"),InlineKeyboardButton("🧭 MTF",callback_data="mtf")],
+        [InlineKeyboardButton("🔥 Best Setup",callback_data="best"),InlineKeyboardButton("🔎 Scan",callback_data="scan")],
+        [InlineKeyboardButton("⏰ Entry Timing",callback_data="timing"),InlineKeyboardButton("🎯 Accuracy",callback_data="accuracy")],
+        [InlineKeyboardButton("📈 Backtest",callback_data="backtest"),InlineKeyboardButton("📜 History",callback_data="history")],
+        [InlineKeyboardButton("🔔 Alerts",callback_data="alerts"),InlineKeyboardButton("💎 Premium",callback_data="premium")],
+        [InlineKeyboardButton("👤 My Account",callback_data="account"),InlineKeyboardButton("ℹ️ Help",callback_data="help")],
+    ])
+
+def back_menu(): return InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Dashboard",callback_data="menu")]])
+
+def pairmenu(mode):
+    ps=list(PAIRS); rows=[]
+    for i in range(0,len(ps),2): rows.append([InlineKeyboardButton(p,callback_data=f"{mode}:{p.replace('/','~')}") for p in ps[i:i+2]])
+    rows.append([InlineKeyboardButton("« Back",callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+def tfmenu(prefix, pair=None):
+    rows=[]
+    for group in (("1m","5m","15m"),("30m","45m","1h"),("4h",)):
+        rows.append([InlineKeyboardButton(t,callback_data=f"{prefix}:{pair.replace('/','~')}:{t}" if pair else f"{prefix}:{t}") for t in group])
+    rows.append([InlineKeyboardButton("« Back",callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+def admin_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Pending Payments",callback_data="admin:payments"),InlineKeyboardButton("👥 Users",callback_data="admin:users")],
+        [InlineKeyboardButton("📊 Stats",callback_data="admin:stats"),InlineKeyboardButton("🩺 Health",callback_data="admin:health")],
+        [InlineKeyboardButton("« Dashboard",callback_data="menu")]
+    ])
+
+async def send_welcome(update, uid=None):
+    if update.message:
+        await update.message.reply_text(WELCOME,parse_mode=ParseMode.HTML,reply_markup=menu(uid or update.effective_user.id))
+
+async def any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user: return
+    ensure_user(update.effective_user)
+    uid=update.effective_user.id
+    text=(update.message.text or "").strip() if update.message else ""
+    state=USER_STATE.get(uid,{})
+    # Payment reference / amount / preference flows
+    if state.get("action")=="payment_reference" and update.message and update.message.photo:
+        method=state.get("method","unknown")
+        proof=update.message.photo[-1].file_id
+        with LOCK:
+            c=con(); c.execute("INSERT INTO payments(user_id,username,amount,method,reference,proof_file_id,status,created) VALUES(?,?,?,?,?,?,?,?)",(uid,update.effective_user.username or "",PREMIUM_PRICE,method,"PHOTO_PROOF",proof,"pending",now_iso())); c.commit(); c.close()
+        USER_STATE.pop(uid,None)
+        await update.message.reply_text("✅ <b>Payment proof submitted</b>\n\nYour payment has been sent for admin review. You will receive a confirmation after approval.",parse_mode=ParseMode.HTML,reply_markup=menu(uid)); return
+    if state.get("action")=="payment_reference" and text and not text.startswith("/"):
+        method=state.get("method","unknown")
+        with LOCK:
+            c=con(); c.execute("INSERT INTO payments(user_id,username,amount,method,reference,status,created) VALUES(?,?,?,?,?,?,?)",(uid,update.effective_user.username or "",PREMIUM_PRICE,method,text[:120],"pending",now_iso())); c.commit(); c.close()
+        USER_STATE.pop(uid,None)
+        await update.message.reply_text("✅ <b>Payment submitted</b>\n\nYour transaction reference has been sent for admin review. You will receive a confirmation after approval.",parse_mode=ParseMode.HTML,reply_markup=menu(uid)); return
+    # Any text including /start opens the same dashboard.
+    await send_welcome(update,uid)
+
+# ---------------- Feature handlers ----------------
+
+async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer(); uid=q.from_user.id; ensure_user(q.from_user); d=q.data
+    try:
+        if d=="menu": return await q.message.reply_text(WELCOME,parse_mode=ParseMode.HTML,reply_markup=menu(uid))
+        if d=="signal": return await q.message.reply_text("📊 <b>Choose currency pair</b>",parse_mode=ParseMode.HTML,reply_markup=pairmenu("signal"))
+        if d.startswith("signal:"):
+            p=d.split(":",1)[1].replace("~","/"); return await q.message.reply_text(f"⏱ <b>{p}</b> — choose entry timeframe",parse_mode=ParseMode.HTML,reply_markup=tfmenu("run",p))
+        if d.startswith("run:"):
+            _,p,t=d.split(":"); p=p.replace("~","/")
+            if not free_ok(uid): return await q.message.reply_text("🔒 Your free signal allowance is finished. Upgrade to Premium for full access.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Premium",callback_data="premium")],[InlineKeyboardButton("« Back",callback_data="menu")]]))
+            await q.message.reply_text("⏳ <b>Analysing validated market data + MTF confirmation…</b>",parse_mode=ParseMode.HTML)
+            s=make_signal(p,t)
+            consume(uid)
+            with LOCK:
+                c=con(); c.execute("INSERT INTO signals(user_id,pair,tf,direction,score,entry,stop,target,rr,candle,created) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uid,p,t,s["direction"],s["score"],s["entry"],s["stop"],s["target"],s["rr"],s["candle"],now_iso())); c.commit(); c.close()
+            return await q.message.reply_text(fmt_signal(s),parse_mode=ParseMode.HTML,reply_markup=menu(uid))
+        if d=="mtf": return await q.message.reply_text("🧭 <b>Choose pair</b>",parse_mode=ParseMode.HTML,reply_markup=pairmenu("mtf"))
+        if d.startswith("mtf:"):
+            p=d.split(":",1)[1].replace("~","/"); f,sc,m=mtf(p,"15m"); out=[f"🧭 <b>{p} — MTF</b>",f"Final consensus: <b>{f}</b>",f"Quality: <b>{sc}/100</b>",""]+[f"{k}: {v[0]} ({v[1]})" for k,v in m.items()]; return await q.message.reply_text("\n".join(out),parse_mode=ParseMode.HTML,reply_markup=back_menu())
+        if d=="timing": return await q.message.reply_text("⏰ <b>Select timeframe</b>",parse_mode=ParseMode.HTML,reply_markup=tfmenu("time"))
+        if d.startswith("time:"):
+            t=d.split(":")[1]; w=candle_boundary(t); return await q.message.reply_text(f"⏰ <b>{t}</b>\n\nNext candle boundary: <b>{fmt_duration(w)}</b>\n\nEntry rule: wait for the signal confirmation; do not chase a late entry.",parse_mode=ParseMode.HTML,reply_markup=back_menu())
+        if d=="best":
+            if not free_ok(uid): return await q.message.reply_text("🔒 Best Setup is available with Premium.",reply_markup=back_menu())
+            await q.message.reply_text("🔥 <b>Scanning the market…</b>",parse_mode=ParseMode.HTML)
+            results=[]
+            for p in PAIRS:
+                try:
+                    s=make_signal(p,"5m")
+                    if s["direction"]!="WAIT": results.append(s)
+                except Exception as e: db_log("warning","best",f"{p}: {e}")
+            results.sort(key=lambda z:z["score"],reverse=True)
+            if not results: return await q.message.reply_text("🟡 <b>No qualifying setup</b>\n\nMarket conditions are not strong enough right now.",parse_mode=ParseMode.HTML,reply_markup=back_menu())
+            top=results[:5]; text="🔥 <b>BEST SETUPS — 5M</b>\n\n"+"\n".join(f"{i+1}. {s['pair']} — <b>{s['direction']}</b> — {s['score']}/100" for i,s in enumerate(top))+"\n\nTap Get Signal for full entry/SL/TP analysis."; return await q.message.reply_text(text,parse_mode=ParseMode.HTML,reply_markup=menu(uid))
+        if d=="scan":
+            if not premium(uid): return await q.message.reply_text("🔒 Full Market Scanner is Premium.",reply_markup=back_menu())
+            await q.message.reply_text("🔎 <b>Scanning all supported pairs…</b>",parse_mode=ParseMode.HTML)
+            results=[]
+            for p in PAIRS:
+                try: results.append(make_signal(p,"5m"))
+                except Exception as e: db_log("warning","scan",f"{p}: {e}")
+            results=[s for s in results if s["direction"]!="WAIT"]; results.sort(key=lambda z:z["score"],reverse=True)
+            text="🔎 <b>MARKET SCANNER</b>\n\n"+("\n".join(f"{s['pair']} — {s['direction']} — {s['score']}/100" for s in results[:10]) or "No qualifying setup."); return await q.message.reply_text(text,parse_mode=ParseMode.HTML,reply_markup=back_menu())
+        if d=="accuracy":
+            with LOCK:
+                c=con(); rows=c.execute("SELECT resolved,COUNT(*) n FROM signals WHERE user_id=? GROUP BY resolved",(uid,)).fetchall(); c.close()
+            stats={r["resolved"]:r["n"] for r in rows}; w=stats.get("WIN",0); l=stats.get("LOSS",0); n=w+l; rate=100*w/n if n else 0
+            return await q.message.reply_text(f"🎯 <b>PERFORMANCE</b>\n\nResolved: {n}\n✅ Wins: {w}\n❌ Losses: {l}\n📊 Measured win rate: <b>{rate:.1f}%</b>\n\nThis is historical tracking only, not a future guarantee.",parse_mode=ParseMode.HTML,reply_markup=back_menu())
+        if d=="history":
+            with LOCK:
+                c=con(); rs=c.execute("SELECT pair,tf,direction,score,resolved,created FROM signals WHERE user_id=? ORDER BY id DESC LIMIT 12",(uid,)).fetchall(); c.close()
+            lines=["📜 <b>RECENT SIGNAL HISTORY</b>",""]
+            lines += [f"{r['pair']} {r['tf']} — {r['direction']} — {r['score']}/100 — {r['resolved']}" for r in rs] or ["No signals yet."]
+            return await q.message.reply_text("\n".join(lines),parse_mode=ParseMode.HTML,reply_markup=back_menu())
+        if d=="backtest":
+            if not premium(uid): return await q.message.reply_text("🔒 Backtest is Premium.",reply_markup=back_menu())
+            return await q.message.reply_text("📈 <b>Choose pair for backtest</b>",parse_mode=ParseMode.HTML,reply_markup=pairmenu("back"))
+        if d.startswith("back:"):
+            p=d.split(":",1)[1].replace("~","/"); return await q.message.reply_text(f"📈 <b>{p}</b> — choose timeframe",parse_mode=ParseMode.HTML,reply_markup=tfmenu("bt",p))
+        if d.startswith("bt:"):
+            _,p,t=d.split(":"); p=p.replace("~","/"); await q.message.reply_text("🧪 Running historical simulation…",parse_mode=ParseMode.HTML)
+            x=candles(p,t,700); wins=losses=0; gross_win=gross_loss=0.0
+            for i in range(220,len(x)-1):
+                try: dd,sc,_,xx=analyse(x.iloc[:i+1])
+                except: continue
+                if dd=="WAIT" or sc<MIN_SIGNAL_SCORE: continue
+                e=float(xx.close.iloc[-1]); v=max(float(xx.atr.iloc[-1]),e*0.00008); risk=1.15*v; reward=1.85*v
+                future=x.iloc[i+1:min(i+6,len(x))]
+                if dd=="CALL":
+                    hit_tp=(future.high>=e+reward).any(); hit_sl=(future.low<=e-risk).any()
+                else:
+                    hit_tp=(future.low<=e-reward).any(); hit_sl=(future.high>=e+risk).any()
+                if hit_tp and not hit_sl: wins+=1; gross_win+=reward
+                elif hit_sl and not hit_tp: losses+=1; gross_loss+=risk
+            n=wins+losses; rate=100*wins/n if n else 0; pf=(gross_win/gross_loss) if gross_loss else (gross_win if gross_win else 0)
+            out=f"📈 <b>BACKTEST — {p} {t}</b>\n\nSignals: {n}\n✅ Wins: {wins}\n❌ Losses: {losses}\n🎯 Hit rate: <b>{rate:.1f}%</b>\n⚖️ Approx profit factor: <b>{pf:.2f}</b>\n\n⚠️ Historical simulation is not a guarantee of future results."; return await q.message.reply_text(out,parse_mode=ParseMode.HTML,reply_markup=back_menu())
+        if d=="premium": return await premium_screen(q,uid)
+        if d=="payment_status":
+            with LOCK:
+                c=con(); r=c.execute("SELECT status,method,reference,created,reviewed FROM payments WHERE user_id=? ORDER BY id DESC LIMIT 1",(uid,)).fetchone(); c.close()
+            if not r: text_status="📋 No payment submission found."
+            else: text_status=f"📋 <b>PAYMENT STATUS</b>\n\nStatus: <b>{r['status'].upper()}</b>\nMethod: {r['method']}\nReference: <code>{r['reference']}</code>\nSubmitted: {r['created']}"
+            return await q.message.reply_text(text_status,parse_mode=ParseMode.HTML,reply_markup=back_menu())
+        if d.startswith("pay:"):
+            method=d.split(":",1)[1]; USER_STATE[uid]={"action":"payment_reference","method":method}; return await q.message.reply_text(f"💳 <b>{method}</b> selected.\n\nSend your transaction/reference ID as a normal message.\n\nDo not send card PINs, passwords or OTPs.",parse_mode=ParseMode.HTML,reply_markup=back_menu())
+        if d=="account":
+            r=user_row(uid); pu=premium_until(uid); until=pu.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if pu else "Not active"
+            rows=[[InlineKeyboardButton("👑 Admin Panel",callback_data="admin")]] if is_admin(uid) else []
+            rows.append([InlineKeyboardButton("« Back",callback_data="menu")])
+            return await q.message.reply_text(f"👤 <b>MY ACCOUNT</b>\n\nUser ID: <code>{uid}</code>\nMembership: <b>{'PREMIUM' if premium(uid) else 'FREE'}</b>\nPremium until: {until}\nFree signals remaining: {r['free_signals'] if r else 0}\nAlerts: {'ON' if r and r['alerts'] else 'OFF'}",parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
+        if d=="alerts":
+            if not premium(uid): return await q.message.reply_text("🔒 Auto Alerts are Premium.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade",callback_data="premium")],[InlineKeyboardButton("« Back",callback_data="menu")]]))
+            return await q.message.reply_text("🔔 <b>ALERT SETTINGS</b>\n\nChoose a minimum setup score:",parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("70+",callback_data="alertscore:70"),InlineKeyboardButton("80+",callback_data="alertscore:80"),InlineKeyboardButton("90+",callback_data="alertscore:90")],[InlineKeyboardButton("Toggle ON/OFF",callback_data="alerttoggle")],[InlineKeyboardButton("« Back",callback_data="menu")]]))
+        if d.startswith("alertscore:"):
+            score=int(d.split(":")[1]); with_lock_update_alert(uid,score); return await q.message.reply_text(f"✅ Minimum alert score set to {score}/100.",reply_markup=menu(uid))
+        if d=="alerttoggle":
+            r=user_row(uid); on=0 if r and r["alerts"] else 1
+            with LOCK:
+                c=con(); c.execute("UPDATE users SET alerts=?,updated=? WHERE user_id=?",(on,now_iso(),uid)); c.commit(); c.close()
+            return await q.message.reply_text(f"🔔 Auto Alerts <b>{'ON' if on else 'OFF'}</b>",parse_mode=ParseMode.HTML,reply_markup=menu(uid))
+        if d=="help":
+            helptext="""ℹ️ <b>NexCandle AI HELP</b>\n\n<b>📊 Get Signal</b> — Pair + timeframe analysis with technical indicators and MTF confirmation.\n\n<b>⏰ Entry Timing</b> — Shows the next candle boundary and explains when not to chase a late entry.\n\n<b>🧭 MTF</b> — Higher-timeframe agreement check.\n\n<b>🔥 Best Setup</b> — Ranks strong setups instead of forcing a trade.\n\n<b>🎯 Accuracy</b> — Measured historical results from tracked signals.\n\n<b>📈 Backtest</b> — Historical simulation using the same technical rules.\n\n<b>🔔 Alerts</b> — Premium automatic setup notifications.\n\n<b>💎 Premium</b> — Submit payment reference for admin approval.\n\n<b>🛡 Data safety</b> — Provider failures are handled internally; raw API errors are not shown to users.\n\n⚠️ No system can guarantee the next candle or future profit."""; return await q.message.reply_text(helptext,parse_mode=ParseMode.HTML,reply_markup=back_menu())
+        if d=="admin": return await q.message.reply_text("👑 <b>ADMIN PANEL</b>",parse_mode=ParseMode.HTML,reply_markup=admin_menu())
+        if d.startswith("admin:") and is_admin(uid): return await admin_callback(q,d)
+        if d.startswith("approve:") and is_admin(uid): return await review_payment(q,d,True)
+        if d.startswith("reject:") and is_admin(uid): return await review_payment(q,d,False)
+    except Exception as e:
+        db_log("error","callback",f"{d}: {e}")
+        await q.message.reply_text("⚠️ This operation is temporarily unavailable. Please try again shortly.",reply_markup=back_menu())
+
+def with_lock_update_alert(uid,score):
+    with LOCK:
+        c=con(); c.execute("UPDATE users SET alert_score=?,updated=? WHERE user_id=?",(score,now_iso(),uid)); c.commit(); c.close()
+
+async def premium_screen(q,uid):
+    if premium(uid):
+        pu=premium_until(uid); until=pu.strftime("%Y-%m-%d %H:%M UTC") if pu else "active"
+        text=f"💎 <b>PREMIUM ACTIVE</b>\n\nValid until: <b>{until}</b>\n\nYou have access to advanced scanner, backtest and automatic alerts."
+        return await q.message.reply_text(text,parse_mode=ParseMode.HTML,reply_markup=back_menu())
+    paylines=[]
+    if INDIA_UPI: paylines.append("🇮🇳 India UPI available")
+    if UAE_BOTIM: paylines.append("🇦🇪 UAE BOTIM Pay available")
+    price=f"\n💰 Plan price: <b>{PREMIUM_PRICE}</b>" if PREMIUM_PRICE else ""
+    text="💎 <b>NEXCANDLE PREMIUM</b>\n\nAdvanced scanner • Backtest • Auto alerts • Performance tracking"+price+"\n\nChoose your payment method below. Then send the transaction/reference ID. Admin approval activates Premium." 
+    rows=[]
+    if INDIA_UPI: rows.append([InlineKeyboardButton("🇮🇳 Pay via India UPI",callback_data="pay:India UPI")])
+    if UAE_BOTIM: rows.append([InlineKeyboardButton("🇦🇪 Pay via UAE BOTIM",callback_data="pay:UAE BOTIM")])
+    rows += [[InlineKeyboardButton("📋 Payment Status",callback_data="payment_status")],[InlineKeyboardButton("« Back",callback_data="menu")]]
+    return await q.message.reply_text(text,parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
+
+async def review_payment(q,d,approve):
+    pid=int(d.split(":")[1])
+    with LOCK:
+        c=con(); p=c.execute("SELECT * FROM payments WHERE id=?",(pid,)).fetchone()
+        if not p: c.close(); return await q.message.reply_text("Payment not found.",reply_markup=admin_menu())
+        status="approved" if approve else "rejected"; c.execute("UPDATE payments SET status=?,reviewed=? WHERE id=?",(status,now_iso(),pid))
+        if approve:
+            until=datetime.now(timezone.utc)+timedelta(days=PREMIUM_DAYS); c.execute("UPDATE users SET premium_until=?,updated=? WHERE user_id=?",(until.isoformat(),now_iso(),p["user_id"]))
+        c.commit(); c.close()
+    try:
+        if approve: await q.get_bot().send_message(p["user_id"],f"💎 <b>Premium Activated</b>\n\nValid until: {(datetime.now(timezone.utc)+timedelta(days=PREMIUM_DAYS)).strftime('%Y-%m-%d %H:%M UTC')}",parse_mode=ParseMode.HTML,reply_markup=menu(p["user_id"]))
+        else: await q.get_bot().send_message(p["user_id"],"❌ Your payment was not approved. Please contact admin with the correct transaction reference.",reply_markup=menu(p["user_id"]))
+    except Exception as e: db_log("warning","payment",e)
+    return await q.message.reply_text(f"Payment #{pid} {'approved' if approve else 'rejected'}.",reply_markup=admin_menu())
+
+async def admin_callback(q,d):
+    action=d.split(":",1)[1]
+    if action=="payments":
+        with LOCK:
+            c=con(); rows=c.execute("SELECT * FROM payments WHERE status='pending' ORDER BY id DESC LIMIT 10").fetchall(); c.close()
+        if not rows: return await q.message.reply_text("💳 No pending payments.",reply_markup=admin_menu())
+        for p in rows:
+            txt=f"💳 <b>Payment #{p['id']}</b>\nUser: <code>{p['user_id']}</code> @{p['username']}\nMethod: {p['method']}\nAmount: {p['amount'] or '—'}\nReference: <code>{p['reference']}</code>\nCreated: {p['created']}"
+            kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"approve:{p['id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"reject:{p['id']}")]])
+            await q.message.reply_text(txt,parse_mode=ParseMode.HTML,reply_markup=kb)
+        return
+    if action=="users":
+        with LOCK:
+            c=con(); n=c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]; pr=c.execute("SELECT COUNT(*) n FROM users WHERE premium_until IS NOT NULL AND premium_until>?",(now_iso(),)).fetchone()["n"]; c.close()
+        return await q.message.reply_text(f"👥 Users: {n}\n💎 Active premium: {pr}",reply_markup=admin_menu())
+    if action=="stats":
+        with LOCK:
+            c=con(); n=c.execute("SELECT COUNT(*) n FROM signals").fetchone()["n"]; w=c.execute("SELECT COUNT(*) n FROM signals WHERE resolved='WIN'").fetchone()["n"]; p=c.execute("SELECT COUNT(*) n FROM payments WHERE status='pending'").fetchone()["n"]; c.close()
+        return await q.message.reply_text(f"📊 Signals: {n}\n✅ Wins tracked: {w}\n💳 Pending payments: {p}",reply_markup=admin_menu())
+    if action=="health":
+        return await q.message.reply_text("🩺 <b>SYSTEM HEALTH</b>\n\nBot: ✅\nDatabase: ✅\nProviders: "+", ".join(provider_status())+f"\nCache: {len(MARKET_CACHE)} entries\nAlerts interval: {ALERT_SEC}s",parse_mode=ParseMode.HTML,reply_markup=admin_menu())
+
+# ---------------- Alert worker ----------------
+
+async def alerts_loop(app: Application):
+    while True:
+        try:
+            with LOCK:
+                c=con(); users=c.execute("SELECT user_id,alert_score,alert_tf,alert_direction FROM users WHERE alerts=1").fetchall(); c.close()
+            for row in users:
+                uid=row["user_id"]
+                if not premium(uid): continue
+                tf=row["alert_tf"] or "5m"; minscore=int(row["alert_score"] or 80); direction=row["alert_direction"] or "BOTH"
+                for p in PAIRS:
+                    try:
+                        s=make_signal(p,tf)
+                        if s["direction"]=="WAIT" or s["score"]<minscore or (direction!="BOTH" and s["direction"]!=direction): continue
+                        fresh=False
+                        with LOCK:
+                            c=con()
+                            try:
+                                c.execute("INSERT INTO alert_events(user_id,pair,tf,direction,candle) VALUES(?,?,?,?,?)",(uid,p,tf,s["direction"],s["candle"])); c.commit(); fresh=True
+                            except sqlite3.IntegrityError: pass
+                            c.close()
+                        if fresh:
+                            await app.bot.send_message(uid,"🔔 <b>PREMIUM AUTO ALERT</b>\n\n"+fmt_signal(s),parse_mode=ParseMode.HTML,reply_markup=menu(uid))
+                    except Exception as e:
+                        db_log("warning","alerts",f"{p}/{tf}: {e}")
+        except Exception as e: db_log("error","alerts",e)
+        await asyncio.sleep(ALERT_SEC)
+
+
+async def signal_resolver_loop(app: Application):
+    """Resolve tracked signals when TP/SL is reached or the signal expires.
+    This is a monitoring layer, not a broker execution engine.
+    """
+    while True:
+        try:
+            with LOCK:
+                c=con(); rows=c.execute("SELECT * FROM signals WHERE resolved='PENDING' AND entry IS NOT NULL ORDER BY id ASC LIMIT 100").fetchall(); c.close()
+            for r in rows:
+                try:
+                    created=datetime.fromisoformat(r['created']);
+                    if created.tzinfo is None: created=created.replace(tzinfo=timezone.utc)
+                    age=(datetime.now(timezone.utc)-created).total_seconds()
+                    max_age=TF_SECONDS.get(r['tf'],300)*12
+                    x=candles(r['pair'],r['tf'],80)
+                    if x.empty: continue
+                    high=float(x.high.iloc[-1]); low=float(x.low.iloc[-1])
+                    direction=r['direction']; stop=float(r['stop']); target=float(r['target'])
+                    result=None; reason=''
+                    if direction=='CALL':
+                        hit_tp=high>=target; hit_sl=low<=stop
+                    else:
+                        hit_tp=low<=target; hit_sl=high>=stop
+                    if hit_tp and hit_sl:
+                        result='AMBIGUOUS'; reason='TP and SL were touched in the same observed candle; no precise intrabar order available.'
+                    elif hit_tp:
+                        result='WIN'; reason='Target reached.'
+                    elif hit_sl:
+                        result='LOSS'; reason='Stop reached.'
+                    elif age>max_age:
+                        result='EXPIRED'; reason='Signal validity window ended without TP/SL confirmation.'
+                    if result:
+                        with LOCK:
+                            c=con(); c.execute("UPDATE signals SET resolved=?,resolved_at=?,result_reason=? WHERE id=? AND resolved='PENDING'",(result,now_iso(),reason,r['id'])); c.commit(); c.close()
+                except Exception as e:
+                    db_log('warning','resolver',f"signal {r['id']}: {e}")
+        except Exception as e:
+            db_log('error','resolver',e)
+        await asyncio.sleep(max(30, ALERT_SEC))
+
+async def post_init(app):
+    app.create_task(alerts_loop(app))
+    app.create_task(signal_resolver_loop(app))
+
+# ---------------- Main ----------------
+
+def main():
+    if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+    init()
+    threading.Thread(target=run_web,daemon=True).start()
+    app=Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    # No /start dependency. Commands and ordinary text/photos are handled by the same welcome handler.
+    app.add_handler(CallbackQueryHandler(cb))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, any_message))
+    app.run_polling(drop_pending_updates=True)
+
+if __name__=="__main__": main()
