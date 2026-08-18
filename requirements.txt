@@ -1,8 +1,0 @@
-fastapi
-uvicorn[standard]
-python-telegram-bot>=20,<23
-python-dotenv
-requests
-numpy
-pandas
-scikit-learn
