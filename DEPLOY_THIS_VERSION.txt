@@ -1,5 +1,0 @@
-NexCandle AI PRO
-V30 DEFINITIVE BUILD
-V30-DEFINITIVE-2026-08-26-1142
-
-Render start command: python app.py
