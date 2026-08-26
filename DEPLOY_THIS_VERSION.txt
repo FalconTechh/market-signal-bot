@@ -1,3 +1,0 @@
-V30 FINAL ALL FOREX
-
-Upload the CONTENTS of this folder to the ROOT of the GitHub repository connected to Render. app.py MUST be in the repository root. Then use Render: Clear build cache & deploy.
