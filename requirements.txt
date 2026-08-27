@@ -1,6 +1,0 @@
-Flask
-pandas
-numpy
-requests
-python-telegram-bot>=20,<23
-websocket-client
