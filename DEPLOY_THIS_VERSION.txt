@@ -1,5 +1,0 @@
-NexCandle AI PRO V35
-
-Features: 10 fixed FX pairs; 1 MIN, 30 MIN, 1 HOUR public timeframes; completed-candle-only signals; 1m direct-feed priority; shorter 1m cache; balanced UP/DOWN/WAIT gate.
-
-Deploy: replace the previous project files with this archive, commit/push, then redeploy on Render. Confirm the startup/build ID contains V35-BALANCED-CANDLE-10-PAIRS-1M-30M-1H-2026-08-28.
