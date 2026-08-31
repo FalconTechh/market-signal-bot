@@ -1,0 +1,48 @@
+# NexCandle AI PRO V40 — MAHIM
+
+## Fixed public configuration
+- 15 currency pairs only:
+  GBP/JPY, AUD/CAD, AUD/CHF, AUD/JPY, AUD/USD,
+  CAD/CHF, CAD/JPY, EUR/CAD, EUR/CHF, EUR/GBP,
+  EUR/USD, GBP/CAD, GBP/CHF, USD/CAD, USD/JPY
+- Timeframes only: 1 MIN, 5 MIN, 1 HOUR
+- Developer display name: MAHIM
+- Maximum 20 candles are retained/returned to the signal engine.
+- Only validated completed OHLC candles are analyzed.
+- No synthetic/fake candle generation is used by the signal path.
+- An unfinished current candle is removed before analysis.
+
+## Data reliability
+Provider failover remains enabled. A stale feed is rejected rather than converted into a fresh-looking signal. Provider-specific errors are kept in server logs while the public API returns a clean temporary-data-unavailable response.
+
+## Signal model
+The next-candle classifier uses candle structure, body/close pressure, wick rejection, engulfing/inside-bar context, recent sequence pressure, breakout context, extreme rejection, continuation/reversal checks and candle-size quality. A weak/conflicting setup can return WAIT instead of forcing UP or DOWN.
+
+This is a probabilistic market-data model; it cannot guarantee the next candle's direction.
+
+## Deploy
+Upload the ZIP contents to Render and redeploy the service. Keep the existing environment/API keys. Do not mix files from older V34/V35/V36 builds.
+
+
+## V39 Crypto Hyper Engine
+- Market switch: FOREX / CRYPTO
+- Binance Spot completed klines only
+- Crypto: BTC/USDT, ETH/USDT, BNB/USDT, SOL/USDT, XRP/USDT, DOGE/USDT, ADA/USDT, AVAX/USDT, LINK/USDT, TRX/USDT
+- Timeframes: 1m, 5m, 1h
+- EMA/RSI/MACD/ATR/ADX/Bollinger/Stochastic/volume/taker-buy/candle-pressure/breakout confluence
+- Walk-forward historical calibration and explicit WAIT on weak evidence
+- No synthetic/fake candles
+
+
+## V40 Binance connectivity fix
+The crypto data layer now tries Binance's dedicated public market-data host
+`data-api.binance.vision` first, followed by Binance's official GCP/API
+redundancy hosts. This directly addresses HTTP 451 responses from the normal
+API cluster on some Render deployments.
+
+- Real Binance Spot klines only.
+- Forming candles are excluded.
+- No synthetic/fake candles.
+- 1m / 5m / 1h only.
+- If all official Binance market-data hosts fail, the API returns a clean
+  temporary-data-unavailable response instead of inventing a signal.
