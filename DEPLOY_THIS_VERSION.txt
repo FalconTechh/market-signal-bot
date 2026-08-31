@@ -1,7 +1,0 @@
-Deploy NexCandle AI PRO V37.
-15 pairs only. Timeframes: 1m, 5m, 1h.
-Developer name: MAHIM.
-Max 20 validated real completed candles. No synthetic candles.
-
-
-V39 UPGRADE: FOREX + CRYPTO market switch. Crypto uses Binance completed Spot klines only; 10 crypto pairs; 1m/5m/1h; Hyper Confluence indicators and walk-forward calibration. No synthetic candles. Developer: MAHIM. Binance public market-data endpoints require no API key for klines.
