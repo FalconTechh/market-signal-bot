@@ -1,0 +1,4 @@
+NexCandle AI PRO V42 — ALL ACCESS BLOCK
+Website access is blocked for desktop, mobile, tablet and other browsers/devices.
+Telegram webhook (/telegram/webhook) and /health remain available.
+Deploy the complete archive.
