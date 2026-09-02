@@ -1,0 +1,5 @@
+V41 MOBILE ACCESS LOCK
+Mobile/tablet browser requests are denied server-side with:
+YOUR ACCOUNT IS TERMINATED / MOBILE ACCESS BLOCKED
+Telegram webhook and Render health endpoints remain available.
+Desktop access is unchanged.
